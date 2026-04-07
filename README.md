@@ -218,6 +218,8 @@ npm install -D @types/passport-jwt @types/bcrypt
 npm install class-validator class-transformer  [For input validation]
 
 npm install winston nest-winston  [For Logging]
+
+npm install @nestjs/throttler   [Rate limiting]
 =======================================================================
 prisma
 ---------
@@ -522,6 +524,21 @@ export class InternalGuard implements CanActivate {
 }
 
 ========================================================================
+[src/health.controller.ts]
+
+import { Controller, Get } from '@nestjs/common'
+
+@Controller('health')
+export class HealthController {
+  @Get()
+  check() {
+    return {
+      status: 'ok',
+      service: 'auth-service',
+      timestamp: new Date().toISOString(),
+    }
+  }
+}
 
 
 =============================================
@@ -570,6 +587,8 @@ npm install axios
 npm install class-validator class-transformer  [For input validation]
 
 npm install winston nest-winston  [For Logging]
+
+npm install @nestjs/throttler   [Rate limiting]
 
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
@@ -896,6 +915,23 @@ export class LoggerMiddleware implements NestMiddleware {
   }
 }
 ==================================================
+[src/health.controller.ts]
+
+import { Controller, Get } from '@nestjs/common'
+
+@Controller('health')
+export class HealthController {
+  @Get()
+  check() {
+    return {
+      status: 'ok',
+      service: 'wallet-service',
+      timestamp: new Date().toISOString(),
+    }
+  }
+}
+
+
 
 ====================================================================
 
@@ -957,6 +993,8 @@ npm install axios
 npm install class-validator class-transformer  [For input validation]
 
 npm install winston nest-winston  [For Logging]
+
+npm install @nestjs/throttler   [Rate limiting]
 
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
@@ -1375,6 +1413,22 @@ export class AppModule implements NestModule {
   }
 }
 
+================================================================================
+[src/health.controller.ts]
+
+import { Controller, Get } from '@nestjs/common'
+
+@Controller('health')
+export class HealthController {
+  @Get()
+  check() {
+    return {
+      status: 'ok',
+      service: 'game-service',
+      timestamp: new Date().toISOString(),
+    }
+  }
+}
 
 ==============================================================
 
@@ -1419,6 +1473,8 @@ npm install -D @types/passport-jwt @types/bcrypt
 npm install class-validator class-transformer  [For input validation]
 
 npm install winston nest-winston  [For Logging]
+
+npm install @nestjs/throttler   [Rate limiting]
 
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
@@ -1689,7 +1745,22 @@ export class AppModule implements NestModule {
   }
 }
 
+=======================================================================
+[src/health.controller.ts]
 
+import { Controller, Get } from '@nestjs/common'
+
+@Controller('health')
+export class HealthController {
+  @Get()
+  check() {
+    return {
+      status: 'ok',
+      service: 'history-service',
+      timestamp: new Date().toISOString(),
+    }
+  }
+}
 
 ======================================
 
