@@ -84,6 +84,9 @@ nginx -v
 sudo nano /etc/nginx/sites-available/viral 
 
 ===================================
+mkdir nginx
+touch nginx/default.conf
+
 [nginx/default.conf]
 
 server {
@@ -1282,7 +1285,7 @@ export class GameController {
 
 npm install @nestjs/schedule
 
-[src/game.cron.ts]
+[src/game/game.cron.ts]
 
 import { Injectable } from '@nestjs/common'
 import { Cron, CronExpression } from '@nestjs/schedule'
