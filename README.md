@@ -2141,6 +2141,22 @@ GRANT ALL PRIVILEGES ON DATABASE viral_wallet_db TO viral_user;
 GRANT ALL PRIVILEGES ON DATABASE viral_game_db TO viral_user;
 GRANT ALL PRIVILEGES ON DATABASE viral_history_db TO viral_user;
 
+=====================================================================================
+
+# Create the .env file in the backend folder
+cat > /workspaces/Notes-after-revise/backend/.env << 'EOF'
+JWT_SECRET=your_super_secret_key_change_this_in_production
+JWT_EXPIRES_IN=1h
+INTERNAL_API_KEY=viral_internal_secret_key_2024
+EOF
+
+
+============================================================================================================
+
+
+
+
+sed -i '/^version:/d' /workspaces/Backend-viral/backend/docker-compose.yml          [version error]
 ========================================================================================================
 =======================================================================================================
 
@@ -2227,4 +2243,73 @@ curl http://localhost/health/history
 
 =======================================================================================================================================================================
 
-                                 
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                 Errors
+
+sudo rm -rf /workspaces/Notes-after-revise/backend/nginx/default.conf
+
+
+mkdir -p /workspaces/Notes-after-revise/backend/nginx
+
+cat > /workspaces/Notes-after-revise/backend/nginx/default.conf << 'EOF'
+server {
+    listen 80;
+    server_name localhost;
+
+    location /auth/ {
+        proxy_pass http://auth:3001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /wallet/ {
+        proxy_pass http://wallet:3002;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /game/ {
+        proxy_pass http://game:3003;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /history/ {
+        proxy_pass http://history:3004;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /health/auth {
+        proxy_pass http://auth:3001/health;
+        proxy_set_header Host $host;
+    }
+
+    location /health/wallet {
+        proxy_pass http://wallet:3002/health;
+        proxy_set_header Host $host;
+    }
+
+    location /health/game {
+        proxy_pass http://game:3003/health;
+        proxy_set_header Host $host;
+    }
+
+    location /health/history {
+        proxy_pass http://history:3004/health;
+        proxy_set_header Host $host;
+    }
+}
+EOF
