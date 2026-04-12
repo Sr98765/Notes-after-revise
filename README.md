@@ -223,6 +223,8 @@ npm install class-validator class-transformer  [For input validation]
 npm install winston nest-winston  [For Logging]
 
 npm install @nestjs/throttler   [Rate limiting]
+
+npm install ioredis @nestjs/cache-manager cache-manager cache-manager-ioredis-yet      [Redis]
 =======================================================================
 prisma
 ---------
@@ -238,6 +240,7 @@ JWT_SECRET=your_super_secret_key_change_this_in_production
 JWT_EXPIRES_IN=1h
 PORT=3001
 INTERNAL_API_KEY=viral_internal_secret_key_2024
+echo "REDIS_URL=redis://localhost:6379"
 
 ========================
 [prisma/schema.prisma]
@@ -459,30 +462,25 @@ import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common'
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler'
 import { APP_GUARD } from '@nestjs/core'
 import { AuthModule } from './auth/auth.module'
+import { RedisModule } from './redis/redis.module'
 import { HealthController } from './health.controller'
 import { LoggerMiddleware } from './middleware/logger.middleware'
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([{
-      ttl: 60000,   // 1 minute window
-      limit: 20,    // max 20 requests per minute per IP
-    }]),
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 20 }]),
+    RedisModule,
     AuthModule,
   ],
   controllers: [HealthController],
-  providers: [
-    {
-      provide: APP_GUARD,
-      useClass: ThrottlerGuard,
-    },
-  ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(LoggerMiddleware).forRoutes('*')
   }
 }
+
 ====================================================================
 [ Create src/utils/retry.ts] or [mkdir -p /workspaces/backend-revise/backend/auth-service/src/utils
 touch /workspaces/backend-revise/backend/auth-service/src/utils/retry.ts]
@@ -544,6 +542,79 @@ export class HealthController {
 }
 
 
+=======================================================================
+                      Redis
+
+[src/redis/redis.module.ts]
+
+import { Module, Global } from '@nestjs/common'
+import { RedisService } from './redis.service'
+
+@Global()
+@Module({
+  providers: [RedisService],
+  exports: [RedisService],
+})
+export class RedisModule {}
+
+===========================================================
+
+[src/redis/redis.service.ts]
+
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common'
+import Redis from 'ioredis'
+
+@Injectable()
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+  private client: Redis
+  private readonly logger = new Logger(RedisService.name)
+
+  async onModuleInit() {
+    this.client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379')
+
+    this.client.on('connect', () => {
+      this.logger.log('Redis connected')
+    })
+
+    this.client.on('error', (err) => {
+      this.logger.error('Redis error', err)
+    })
+  }
+
+  async onModuleDestroy() {
+    await this.client.quit()
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key)
+  }
+
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    if (ttlSeconds) {
+      await this.client.set(key, value, 'EX', ttlSeconds)
+    } else {
+      await this.client.set(key, value)
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    await this.client.del(key)
+  }
+
+  async delPattern(pattern: string): Promise<void> {
+    const keys = await this.client.keys(pattern)
+    if (keys.length > 0) {
+      await this.client.del(...keys)
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    const result = await this.client.exists(key)
+    return result === 1
+  }
+}
+
+
 =============================================
 npx prisma generate
 npx prisma migrate dev --name init
@@ -593,6 +664,8 @@ npm install winston nest-winston  [For Logging]
 
 npm install @nestjs/throttler   [Rate limiting]
 
+npm install ioredis @nestjs/cache-manager cache-manager cache-manager-ioredis-yet      [Redis]
+
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
 
@@ -605,6 +678,7 @@ DATABASE_URL="postgresql://viral_user:viral123@localhost:5432/viral_wallet_db"
 AUTH_SERVICE_URL=http://localhost:3001
 PORT=3002
 INTERNAL_API_KEY=viral_internal_secret_key_2024
+echo "REDIS_URL=redis://localhost:6379"
 
 
 ==========================================
@@ -674,33 +748,66 @@ import { Module } from '@nestjs/common'
 import { WalletService } from './wallet.service'
 import { WalletController } from './wallet.controller'
 import { PrismaService } from '../prisma/prisma.service'
+import { RedisService } from '../redis/redis.service'
 
 @Module({
-  imports: [],                          // ✅ JwtModule removed
-  providers: [WalletService, PrismaService],
+  providers: [WalletService, PrismaService, RedisService],
   controllers: [WalletController],
 })
 export class WalletModule {}
+
 
 ========================================================================
 
 [src/wallet/wallet.service.ts]
 
-import { Injectable, BadRequestException } from '@nestjs/common'
+import { Injectable, BadRequestException, Logger } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service'
+import { RedisService } from '../redis/redis.service'
 import { Decimal } from '@prisma/client/runtime/library'
+
+const BALANCE_TTL = 300        // 5 minutes
+const TRANSACTIONS_TTL = 120   // 2 minutes
 
 @Injectable()
 export class WalletService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(WalletService.name)
+
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   async getBalance(userId: number) {
+    const cacheKey = `wallet:balance:${userId}`
+
+    try {
+      const cached = await this.redis.get(cacheKey)
+      if (cached) {
+        this.logger.log(`Cache HIT for ${cacheKey}`)
+        return { balance: parseFloat(cached), cached: true }
+      }
+      this.logger.log(`Cache MISS for ${cacheKey}`)
+    } catch (err) {
+      this.logger.warn(`Redis error, falling back to DB: ${err.message}`)
+    }
+
     const wallet = await this.prisma.wallet.upsert({
       where: { userId },
       update: {},
       create: { userId, balance: new Decimal(0) },
     })
-    return { balance: wallet.balance.toNumber() }
+
+    const balance = wallet.balance.toNumber()
+
+    try {
+      await this.redis.set(cacheKey, balance.toString(), BALANCE_TTL)
+      this.logger.log(`Cache SET for ${cacheKey} TTL=${BALANCE_TTL}s`)
+    } catch (err) {
+      this.logger.warn(`Redis SET failed: ${err.message}`)
+    }
+
+    return { balance, cached: false }
   }
 
   async deposit(userId: number, amount: number) {
@@ -715,6 +822,9 @@ export class WalletService {
     await this.prisma.transaction.create({
       data: { walletId: wallet.id, type: 'deposit', amount: new Decimal(amount) },
     })
+
+    await this.redis.del(`wallet:balance:${userId}`)
+    await this.redis.del(`wallet:transactions:${userId}`)
 
     return { balance: wallet.balance.toNumber() }
   }
@@ -735,10 +845,25 @@ export class WalletService {
       data: { walletId: wallet.id, type: 'withdraw', amount: new Decimal(amount) },
     })
 
+    await this.redis.del(`wallet:balance:${userId}`)
+    await this.redis.del(`wallet:transactions:${userId}`)
+
     return { balance: updated.balance.toNumber() }
   }
 
   async getTransactions(userId: number) {
+    const cacheKey = `wallet:transactions:${userId}`
+
+    try {
+      const cached = await this.redis.get(cacheKey)
+      if (cached) {
+        this.logger.log(`Cache HIT for ${cacheKey}`)
+        return JSON.parse(cached)
+      }
+    } catch (err) {
+      this.logger.warn(`Redis error: ${err.message}`)
+    }
+
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } })
     if (!wallet) return []
 
@@ -747,10 +872,18 @@ export class WalletService {
       orderBy: { createdAt: 'desc' },
     })
 
-    return transactions.map(t => ({
+    const result = transactions.map(t => ({
       ...t,
       amount: t.amount.toNumber(),
     }))
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), TRANSACTIONS_TTL)
+    } catch (err) {
+      this.logger.warn(`Redis SET failed: ${err.message}`)
+    }
+
+    return result
   }
 }
 
@@ -843,30 +976,25 @@ import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common'
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler'
 import { APP_GUARD } from '@nestjs/core'
 import { WalletModule } from './wallet/wallet.module'
+import { RedisModule } from './redis/redis.module'
 import { HealthController } from './health.controller'
 import { LoggerMiddleware } from './middleware/logger.middleware'
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([{
-      ttl: 60000,
-      limit: 30,    // wallet can have slightly more requests
-    }]),
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 30 }]),
+    RedisModule,
     WalletModule,
   ],
   controllers: [HealthController],
-  providers: [
-    {
-      provide: APP_GUARD,
-      useClass: ThrottlerGuard,
-    },
-  ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(LoggerMiddleware).forRoutes('*')
   }
 }
+
 
 
 ==========================================
@@ -934,6 +1062,77 @@ export class HealthController {
   }
 }
 
+======================================================================================
+                      Redis
+
+[src/redis/redis.module.ts]
+
+import { Module, Global } from '@nestjs/common'
+import { RedisService } from './redis.service'
+
+@Global()
+@Module({
+  providers: [RedisService],
+  exports: [RedisService],
+})
+export class RedisModule {}
+
+===========================================================
+
+[src/redis/redis.service.ts]
+
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common'
+import Redis from 'ioredis'
+
+@Injectable()
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+  private client: Redis
+  private readonly logger = new Logger(RedisService.name)
+
+  async onModuleInit() {
+    this.client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379')
+
+    this.client.on('connect', () => {
+      this.logger.log('Redis connected')
+    })
+
+    this.client.on('error', (err) => {
+      this.logger.error('Redis error', err)
+    })
+  }
+
+  async onModuleDestroy() {
+    await this.client.quit()
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key)
+  }
+
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    if (ttlSeconds) {
+      await this.client.set(key, value, 'EX', ttlSeconds)
+    } else {
+      await this.client.set(key, value)
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    await this.client.del(key)
+  }
+
+  async delPattern(pattern: string): Promise<void> {
+    const keys = await this.client.keys(pattern)
+    if (keys.length > 0) {
+      await this.client.del(...keys)
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    const result = await this.client.exists(key)
+    return result === 1
+  }
+}
 
 
 ====================================================================
@@ -999,6 +1198,8 @@ npm install winston nest-winston  [For Logging]
 
 npm install @nestjs/throttler   [Rate limiting]
 
+npm install ioredis @nestjs/cache-manager cache-manager cache-manager-ioredis-yet      [Redis]
+
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
 
@@ -1012,6 +1213,7 @@ WALLET_SERVICE_URL=http://localhost:3002
 HISTORY_SERVICE_URL=http://localhost:3004
 PORT=3003
 INTERNAL_API_KEY=viral_internal_secret_key_2024
+echo "REDIS_URL=redis://localhost:6379"
 
 ==========================================================
 prisma/schema.prisma
@@ -1390,31 +1592,26 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler'
 import { ScheduleModule } from '@nestjs/schedule'
 import { APP_GUARD } from '@nestjs/core'
 import { GameModule } from './game/game.module'
+import { RedisModule } from './redis/redis.module'
 import { HealthController } from './health.controller'
 import { LoggerMiddleware } from './middleware/logger.middleware'
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([{
-      ttl: 60000,
-      limit: 60,    // games need more requests for active players
-    }]),
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 60 }]),
     ScheduleModule.forRoot(),
+    RedisModule,
     GameModule,
   ],
   controllers: [HealthController],
-  providers: [
-    {
-      provide: APP_GUARD,
-      useClass: ThrottlerGuard,
-    },
-  ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(LoggerMiddleware).forRoutes('*')
   }
 }
+
 
 ================================================================================
 [src/health.controller.ts]
@@ -1433,7 +1630,79 @@ export class HealthController {
   }
 }
 
-==============================================================
+==========================================================================================
+                      Redis
+
+[src/redis/redis.module.ts]
+
+import { Module, Global } from '@nestjs/common'
+import { RedisService } from './redis.service'
+
+@Global()
+@Module({
+  providers: [RedisService],
+  exports: [RedisService],
+})
+export class RedisModule {}
+
+===========================================================
+
+[src/redis/redis.service.ts]
+
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common'
+import Redis from 'ioredis'
+
+@Injectable()
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+  private client: Redis
+  private readonly logger = new Logger(RedisService.name)
+
+  async onModuleInit() {
+    this.client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379')
+
+    this.client.on('connect', () => {
+      this.logger.log('Redis connected')
+    })
+
+    this.client.on('error', (err) => {
+      this.logger.error('Redis error', err)
+    })
+  }
+
+  async onModuleDestroy() {
+    await this.client.quit()
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key)
+  }
+
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    if (ttlSeconds) {
+      await this.client.set(key, value, 'EX', ttlSeconds)
+    } else {
+      await this.client.set(key, value)
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    await this.client.del(key)
+  }
+
+  async delPattern(pattern: string): Promise<void> {
+    const keys = await this.client.keys(pattern)
+    if (keys.length > 0) {
+      await this.client.del(...keys)
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    const result = await this.client.exists(key)
+    return result === 1
+  }
+}
+
+===============================================================================
 
 npm run start:dev
 =============================
@@ -1479,6 +1748,8 @@ npm install winston nest-winston  [For Logging]
 
 npm install @nestjs/throttler   [Rate limiting]
 
+npm install ioredis @nestjs/cache-manager cache-manager cache-manager-ioredis-yet      [Redis]
+
 npm install prisma@4 --save-dev
 npm install @prisma/client@4
 
@@ -1490,6 +1761,7 @@ npx prisma init
 DATABASE_URL="postgresql://viral_user:viral123@localhost:5432/viral_history_db"
 PORT=3004
 INTERNAL_API_KEY=viral_internal_secret_key_2024
+echo "REDIS_URL=redis://localhost:6379"
 
 
 ===========================================
@@ -1554,27 +1826,58 @@ npx nest g controller history
 
 [src/history/history.service.ts]
 
-import { Injectable, BadRequestException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common'
+import { PrismaService } from '../prisma/prisma.service'
+import { RedisService } from '../redis/redis.service'
+
+const LEADERBOARD_TTL = 120   // 2 minutes
+const PLAYER_STATS_TTL = 300  // 5 minutes
 
 @Injectable()
 export class HistoryService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(HistoryService.name)
+
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   async getPlayerStats(username: string) {
-    if (!username) throw new BadRequestException('Username is required');
+    if (!username) throw new BadRequestException('Username is required')
+
+    const cacheKey = `history:player:${username}`
+
+    try {
+      const cached = await this.redis.get(cacheKey)
+      if (cached) {
+        this.logger.log(`Cache HIT for ${cacheKey}`)
+        return { ...JSON.parse(cached), cached: true }
+      }
+      this.logger.log(`Cache MISS for ${cacheKey}`)
+    } catch (err) {
+      this.logger.warn(`Redis error: ${err.message}`)
+    }
 
     const player = await this.prisma.playerStats.findUnique({
       where: { username },
-    });
+    })
 
-    return player || null;
+    if (!player) return null
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(player), PLAYER_STATS_TTL)
+      this.logger.log(`Cache SET for ${cacheKey}`)
+    } catch (err) {
+      this.logger.warn(`Redis SET failed: ${err.message}`)
+    }
+
+    return player
   }
 
   async upsertPlayerStats(username: string, bets: number, wins: number, losses: number) {
-    if (!username) throw new BadRequestException('Username is required');
+    if (!username) throw new BadRequestException('Username is required')
 
-    return this.prisma.playerStats.upsert({
+    const result = await this.prisma.playerStats.upsert({
       where: { username },
       create: { username, totalBets: bets, totalWins: wins, totalLosses: losses },
       update: {
@@ -1582,16 +1885,45 @@ export class HistoryService {
         totalWins: { increment: wins },
         totalLosses: { increment: losses },
       },
-    });
+    })
+
+    await this.redis.del(`history:player:${username}`)
+    await this.redis.del('history:leaderboard')
+    this.logger.log(`Cache invalidated for player:${username} and leaderboard`)
+
+    return result
   }
 
   async getLeaderboard(limit = 10) {
-    return this.prisma.playerStats.findMany({
+    const cacheKey = 'history:leaderboard'
+
+    try {
+      const cached = await this.redis.get(cacheKey)
+      if (cached) {
+        this.logger.log(`Cache HIT for ${cacheKey}`)
+        return JSON.parse(cached)
+      }
+      this.logger.log(`Cache MISS for ${cacheKey}`)
+    } catch (err) {
+      this.logger.warn(`Redis error: ${err.message}`)
+    }
+
+    const leaderboard = await this.prisma.playerStats.findMany({
       orderBy: { totalWins: 'desc' },
       take: limit,
-    });
+    })
+
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(leaderboard), LEADERBOARD_TTL)
+      this.logger.log(`Cache SET for ${cacheKey}`)
+    } catch (err) {
+      this.logger.warn(`Redis SET failed: ${err.message}`)
+    }
+
+    return leaderboard
   }
 }
+
 
 ===============================================
 
@@ -1629,16 +1961,18 @@ export class HistoryController {
 [src/history/history.module.ts]
 
 
-import { Module } from '@nestjs/common';
-import { HistoryService } from './history.service';
-import { HistoryController } from './history.controller';
-import { PrismaService } from '../prisma/prisma.service';
+import { Module } from '@nestjs/common'
+import { HistoryService } from './history.service'
+import { HistoryController } from './history.controller'
+import { PrismaService } from '../prisma/prisma.service'
+import { RedisService } from '../redis/redis.service'
 
 @Module({
-  providers: [HistoryService, PrismaService],
+  providers: [HistoryService, PrismaService, RedisService],
   controllers: [HistoryController],
 })
 export class HistoryModule {}
+
 
 ====================================================================
 [src/history/dto/upsert.dto.ts]
@@ -1723,30 +2057,25 @@ import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common'
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler'
 import { APP_GUARD } from '@nestjs/core'
 import { HistoryModule } from './history/history.module'
+import { RedisModule } from './redis/redis.module'
 import { HealthController } from './health.controller'
 import { LoggerMiddleware } from './middleware/logger.middleware'
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([{
-      ttl: 60000,
-      limit: 30,
-    }]),
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 30 }]),
+    RedisModule,
     HistoryModule,
   ],
   controllers: [HealthController],
-  providers: [
-    {
-      provide: APP_GUARD,
-      useClass: ThrottlerGuard,
-    },
-  ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(LoggerMiddleware).forRoutes('*')
   }
 }
+
 
 =======================================================================
 [src/health.controller.ts]
@@ -1765,7 +2094,79 @@ export class HealthController {
   }
 }
 
-======================================
+==========================================================================================
+                      Redis
+
+[src/redis/redis.module.ts]
+
+import { Module, Global } from '@nestjs/common'
+import { RedisService } from './redis.service'
+
+@Global()
+@Module({
+  providers: [RedisService],
+  exports: [RedisService],
+})
+export class RedisModule {}
+
+===========================================================
+
+[src/redis/redis.service.ts]
+
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common'
+import Redis from 'ioredis'
+
+@Injectable()
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+  private client: Redis
+  private readonly logger = new Logger(RedisService.name)
+
+  async onModuleInit() {
+    this.client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379')
+
+    this.client.on('connect', () => {
+      this.logger.log('Redis connected')
+    })
+
+    this.client.on('error', (err) => {
+      this.logger.error('Redis error', err)
+    })
+  }
+
+  async onModuleDestroy() {
+    await this.client.quit()
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key)
+  }
+
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    if (ttlSeconds) {
+      await this.client.set(key, value, 'EX', ttlSeconds)
+    } else {
+      await this.client.set(key, value)
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    await this.client.del(key)
+  }
+
+  async delPattern(pattern: string): Promise<void> {
+    const keys = await this.client.keys(pattern)
+    if (keys.length > 0) {
+      await this.client.del(...keys)
+    }
+  }
+
+  async exists(key: string): Promise<boolean> {
+    const result = await this.client.exists(key)
+    return result === 1
+  }
+}
+
+=============================================
 
 npm run start:dev
 
@@ -2026,11 +2427,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_auth_db
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      REDIS_URL: redis://redis:6379
       PORT: 3001
     ports:
       - "3001:3001"
@@ -2050,10 +2454,13 @@ services:
         condition: service_healthy
       auth:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_wallet_db
       AUTH_SERVICE_URL: http://auth:3001
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      REDIS_URL: redis://redis:6379
       PORT: 3002
     ports:
       - "3002:3002"
@@ -2073,11 +2480,14 @@ services:
         condition: service_healthy
       wallet:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_game_db
       WALLET_SERVICE_URL: http://wallet:3002
       HISTORY_SERVICE_URL: http://history:3004
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      REDIS_URL: redis://redis:6379
       PORT: 3003
     ports:
       - "3003:3003"
@@ -2095,9 +2505,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_history_db
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      REDIS_URL: redis://redis:6379
       PORT: 3004
     ports:
       - "3004:3004"
@@ -2124,7 +2537,7 @@ services:
 
 volumes:
   postgres_data:
-
+  
 ====================================================================================================
 
 Create database init script
