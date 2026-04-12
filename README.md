@@ -2571,6 +2571,26 @@ EOF
 
 sed -i '/^version:/d' /workspaces/Backend-viral/backend/docker-compose.yml          [version error]
 ========================================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 =======================================================================================================
 
 ============ Starting up each day ======================
@@ -2655,7 +2675,63 @@ curl http://localhost/health/game
 curl http://localhost/health/history
 
 =======================================================================================================================================================================
+                     Redis testing
+                     -------------
 
+
+ Rebuild and restart
+ 
+[workspaces/Backend-viral/backend]
+
+docker-compose down
+docker-compose build --no-cache
+docker-compose up -d
+
+
+Test caching properly
+#Login first
+
+TOKEN=$(curl -s -X POST http://localhost/auth/login \
+-H "Content-Type: application/json" \
+-d '{"email":"docker@viral.com","password":"123456"}' | jq -r '.token')
+
+echo "Token: $TOKEN"
+
+# First call — should show cached: false
+echo "--- First balance call ---"
+curl -s http://localhost/wallet/balance -H "Authorization: Bearer $TOKEN" | jq
+
+# Second call — should show cached: true
+echo "--- Second balance call ---"
+curl -s http://localhost/wallet/balance -H "Authorization: Bearer $TOKEN" | jq
+
+# First leaderboard
+echo "--- First leaderboard ---"
+curl -s http://localhost/history/leaderboard | jq
+
+# Second leaderboard — from cache
+echo "--- Second leaderboard ---"
+curl -s http://localhost/history/leaderboard | jq
+
+Step 5 — Verify keys in Redis
+bashdocker exec -it viral_redis redis-cli
+
+# List all keys
+KEYS *
+
+# Check TTL remaining on balance key
+TTL wallet:balance:1
+
+# Check the value
+GET wallet:balance:1
+
+# Check leaderboard
+GET history:leaderboard
+
+exit
+
+
+=================================================================================================================================
 
 
 
