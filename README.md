@@ -117,6 +117,12 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
     }
 
+    location /fairness/ {
+        proxy_pass http://fairness:3005;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
     location /health/auth {
         proxy_pass http://auth:3001/health;
         proxy_set_header Host $host;
@@ -136,8 +142,12 @@ server {
         proxy_pass http://history:3004/health;
         proxy_set_header Host $host;
     }
-}
 
+    location /health/fairness {
+        proxy_pass http://fairness:3005/health;
+        proxy_set_header Host $host;
+    }
+}
 [Save with Ctrl+O, then Enter, then Ctrl+X to exit.]
 
 cat /etc/nginx/sites-available/viral       [verify]
@@ -1213,7 +1223,8 @@ WALLET_SERVICE_URL=http://localhost:3002
 HISTORY_SERVICE_URL=http://localhost:3004
 PORT=3003
 INTERNAL_API_KEY=viral_internal_secret_key_2024
-echo "REDIS_URL=redis://localhost:6379"
+REDIS_URL=redis://localhost:6379
+FAIRNESS_SERVICE_URL=http://localhost:3005
 
 ==========================================================
 prisma/schema.prisma
@@ -1318,6 +1329,7 @@ import axios from 'axios'
 
 const WALLET_SERVICE_URL = process.env.WALLET_SERVICE_URL || 'http://localhost:3002'
 const HISTORY_SERVICE_URL = process.env.HISTORY_SERVICE_URL || 'http://localhost:3004'
+const FAIRNESS_SERVICE_URL = process.env.FAIRNESS_SERVICE_URL || 'http://localhost:3005'
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || ''
 
 @Injectable()
@@ -1332,13 +1344,15 @@ export class GameService {
     return this.prisma.player.findMany()
   }
 
-  async playRound(playerId: number, bet: number, authHeader: string) {
+  async playRound(playerId: number, bet: number, authHeader: string, userId: number) {
     if (bet <= 0) throw new BadRequestException('Bet must be > 0')
 
+    // 1. Create pending transaction log
     const txLog = await this.prisma.gameTransaction.create({
       data: { playerId, bet: new Decimal(bet), status: 'pending' },
     })
 
+    // 2. Withdraw bet from wallet
     try {
       await callWithRetry(() =>
         axios.post(
@@ -1362,10 +1376,35 @@ export class GameService {
       )
     }
 
-    const win = Math.random() < 0.5
-    const payout = win ? bet * 2 : 0
-    const result = win ? 'win' : 'lose'
+    // 3. Get provably fair result from fairness service
+    let fairnessResult: any
+    try {
+      const response = await callWithRetry(() =>
+        axios.post(
+          `${FAIRNESS_SERVICE_URL}/fairness/play`,
+          { userId, gameType: 'coinflip' },
+          { headers: { 'x-internal-key': INTERNAL_API_KEY } },
+        )
+      )
+      fairnessResult = response.data
+    } catch {
+      // Fallback to basic random if fairness service is down
+      const win = Math.random() < 0.5
+      fairnessResult = {
+        result: win ? 'win' : 'lose',
+        payout: win ? 2 : 0,
+        outcome: Math.random(),
+        serverSeedHash: 'unavailable',
+        clientSeed: 'unavailable',
+        nonce: 0,
+      }
+    }
 
+    const win = fairnessResult.result === 'win'
+    const payout = win ? bet * fairnessResult.payout : 0
+    const result = fairnessResult.result
+
+    // 4. Pay out winnings if won
     if (win) {
       try {
         await callWithRetry(() =>
@@ -1389,11 +1428,13 @@ export class GameService {
       }
     }
 
+    // 5. Mark transaction complete
     await this.prisma.gameTransaction.update({
       where: { id: txLog.id },
       data: { status: 'complete', result, payout: new Decimal(payout) },
     })
 
+    // 6. Save round
     const round = await this.prisma.gameRound.create({
       data: {
         playerId,
@@ -1403,6 +1444,7 @@ export class GameService {
       },
     })
 
+    // 7. Push to history
     const player = await this.prisma.player.findUnique({ where: { id: playerId } })
     if (player) {
       axios.post(`${HISTORY_SERVICE_URL}/history/upsert`, {
@@ -1417,6 +1459,13 @@ export class GameService {
       ...round,
       bet: round.bet.toNumber(),
       payout: round.payout.toNumber(),
+      fairness: {
+        serverSeedHash: fairnessResult.serverSeedHash,
+        clientSeed: fairnessResult.clientSeed,
+        nonce: fairnessResult.nonce,
+        outcome: fairnessResult.outcome,
+        message: fairnessResult.message,
+      },
     }
   }
 
@@ -1448,17 +1497,47 @@ export class GameService {
 }
 
 
+
 ==================================================================
 [src/game.controller.ts]
 
-import { Controller, Post, Body, Get, Param, Headers, BadRequestException } from '@nestjs/common'
+import {
+  Controller, Post, Body, Get, Param,
+  Headers, BadRequestException, UnauthorizedException
+} from '@nestjs/common'
 import { GameService } from './game.service'
 import { PlayDto } from './dto/play.dto'
 import { CreatePlayerDto } from './dto/create-player.dto'
+import { callWithRetry } from '../utils/retry'
+import axios from 'axios'
+
+const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://localhost:3001'
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || ''
 
 @Controller('game')
 export class GameController {
   constructor(private gameService: GameService) {}
+
+  private async getUserId(authHeader: string): Promise<number> {
+    if (!authHeader) throw new BadRequestException('Authorization header required')
+    try {
+      const response = await callWithRetry(() =>
+        axios.post(
+          `${AUTH_SERVICE_URL}/auth/verify`,
+          {},
+          {
+            headers: {
+              authorization: authHeader,
+              'x-internal-key': INTERNAL_API_KEY,
+            },
+          },
+        )
+      )
+      return response.data.id
+    } catch {
+      throw new UnauthorizedException('Invalid or expired token')
+    }
+  }
 
   @Post('player')
   createPlayer(@Body() body: CreatePlayerDto) {
@@ -1471,9 +1550,12 @@ export class GameController {
   }
 
   @Post('play')
-  playRound(@Headers('authorization') auth: string, @Body() body: PlayDto) {
-    if (!auth) throw new BadRequestException('Authorization header required')
-    return this.gameService.playRound(body.playerId, body.bet, auth)
+  async playRound(
+    @Headers('authorization') auth: string,
+    @Body() body: PlayDto,
+  ) {
+    const userId = await this.getUserId(auth)
+    return this.gameService.playRound(body.playerId, body.bet, auth, userId)
   }
 
   @Get('rounds/:playerId')
@@ -1481,6 +1563,7 @@ export class GameController {
     return this.gameService.getRounds(Number(playerId))
   }
 }
+
 
 =======================================================================
 [install package for scheduling tasks in nestjs application / runs automatic background jobs, like a cron system]
@@ -2254,6 +2337,623 @@ curl -X GET http://localhost:3004/history/leaderboard
 
 
 
+==================================================================================================
+==================================================================================================
+                                     Provalbly -fair-servic
+================================================================================================
+cd /workspaces/Backend-viral/backend
+nest new provably-fair-service --package-manager npm
+
+=================================================
+
+npm install prisma@4 --save-dev
+npm install @prisma/client@4
+npm install axios
+npm install class-validator class-transformer
+npx prisma init
+
+============================================================
+[.env]
+
+DATABASE_URL="postgresql://viral_user:viral123@localhost:5432/viral_fairness_db"
+INTERNAL_API_KEY=viral_internal_secret_key_2024
+PORT=3005
+
+===============================================================================
+[create Database]
+
+sudo service postgresql start
+
+psql -h localhost -U viral_user -d viral_auth_db -c "CREATE DATABASE viral_fairness_db;"
+psql -h localhost -U viral_user -d viral_fairness_db -c "GRANT ALL PRIVILEGES ON SCHEMA public TO viral_user;"
+
+=============================================================================
+[prisma.schema]
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SeedPair {
+  id             Int      @id @default(autoincrement())
+  userId         Int
+  serverSeed     String   // hashed — never revealed until round ends
+  serverSeedHash String   // shown to player before round
+  clientSeed     String
+  nonce          Int      @default(0)
+  revealed       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+}
+
+model FairnessRecord {
+  id             Int      @id @default(autoincrement())
+  userId         Int
+  serverSeed     String   // revealed after round
+  serverSeedHash String
+  clientSeed     String
+  nonce          Int
+  result         String   // win or lose
+  outcome        Float    // the random float used
+  gameType       String   @default("coinflip")
+  createdAt      DateTime @default(now())
+}
+
+=================================================================================
+npx prisma generate
+npx prisma migrate dev --name init
+=================================================================================
+
+npx nest g service prisma
+
+[provably-fair-service/src/prisma/prisma.service.ts]
+
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common'
+import { PrismaClient } from '@prisma/client'
+
+@Injectable()
+export class PrismaService extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy {
+
+  async onModuleInit() {
+    await this.$connect()
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect()
+  }
+}
+
+==================================================================================
+mkdir -p /workspaces/Backend-viral/backend/provably-fair-service/src/engine
+
+[provably-fair-service/src/engine/fairness.engine.ts]
+
+import * as crypto from 'crypto'
+
+export class FairnessEngine {
+
+  // Generate a random server seed
+  static generateServerSeed(): string {
+    return crypto.randomBytes(32).toString('hex')
+  }
+
+  // Hash the server seed — shown to player BEFORE the round
+  static hashServerSeed(serverSeed: string): string {
+    return crypto.createHash('sha256').update(serverSeed).digest('hex')
+  }
+
+  // Generate the outcome using server seed + client seed + nonce
+  static generateOutcome(
+    serverSeed: string,
+    clientSeed: string,
+    nonce: number,
+  ): number {
+    const combined = `${serverSeed}:${clientSeed}:${nonce}`
+    const hash = crypto.createHmac('sha256', serverSeed)
+      .update(combined)
+      .digest('hex')
+
+    // Take first 8 hex chars and convert to float between 0 and 1
+    const decimal = parseInt(hash.slice(0, 8), 16)
+    return decimal / 0xffffffff
+  }
+
+  // Determine game result from outcome float
+  static getCoinflipResult(outcome: number): {
+    result: string
+    payout: number
+    outcome: number
+  } {
+    const win = outcome < 0.5
+    return {
+      result: win ? 'win' : 'lose',
+      payout: win ? 2 : 0,
+      outcome,
+    }
+  }
+
+  // Verify a past round — player can call this with revealed server seed
+  static verifyRound(
+    serverSeed: string,
+    serverSeedHash: string,
+    clientSeed: string,
+    nonce: number,
+  ): {
+    valid: boolean
+    outcome: number
+    result: string
+    computedHash: string
+  } {
+    // Verify the server seed matches the hash shown before the round
+    const computedHash = this.hashServerSeed(serverSeed)
+    const valid = computedHash === serverSeedHash
+
+    const outcome = this.generateOutcome(serverSeed, clientSeed, nonce)
+    const { result } = this.getCoinflipResult(outcome)
+
+    return { valid, outcome, result, computedHash }
+  }
+}
+=========================================================================================
+npx nest g module fairness
+npx nest g service fairness
+npx nest g controller fairness
+
+===========================================================
+[src/fairness/fairness.service.ts]
+
+import { Injectable, BadRequestException } from '@nestjs/common'
+import { PrismaService } from '../prisma/prisma.service'
+import { FairnessEngine } from '../engine/fairness.engine'
+
+@Injectable()
+export class FairnessService {
+  constructor(private prisma: PrismaService) {}
+
+  // Called when player starts a new session or rotates seeds
+  async initSeedPair(userId: number, clientSeed?: string) {
+    const serverSeed = FairnessEngine.generateServerSeed()
+    const serverSeedHash = FairnessEngine.hashServerSeed(serverSeed)
+    const finalClientSeed = clientSeed || FairnessEngine.generateServerSeed()
+
+    const seedPair = await this.prisma.seedPair.create({
+      data: {
+        userId,
+        serverSeed,
+        serverSeedHash,
+        clientSeed: finalClientSeed,
+        nonce: 0,
+      },
+    })
+
+    // Never return the raw serverSeed — only the hash
+    return {
+      id: seedPair.id,
+      serverSeedHash: seedPair.serverSeedHash,
+      clientSeed: seedPair.clientSeed,
+      nonce: seedPair.nonce,
+      message: 'Seed pair created. serverSeedHash proves fairness before the round.',
+    }
+  }
+
+  // Called by game-service to play a round
+  async playRound(userId: number, gameType: string = 'coinflip') {
+    // Get active seed pair for this user
+    let seedPair = await this.prisma.seedPair.findFirst({
+      where: { userId, revealed: false },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    // Auto-create if none exists
+    if (!seedPair) {
+      const serverSeed = FairnessEngine.generateServerSeed()
+      const serverSeedHash = FairnessEngine.hashServerSeed(serverSeed)
+      seedPair = await this.prisma.seedPair.create({
+        data: {
+          userId,
+          serverSeed,
+          serverSeedHash,
+          clientSeed: FairnessEngine.generateServerSeed(),
+          nonce: 0,
+        },
+      })
+    }
+
+    // Generate outcome
+    const outcome = FairnessEngine.generateOutcome(
+      seedPair.serverSeed,
+      seedPair.clientSeed,
+      seedPair.nonce,
+    )
+
+    const { result, payout } = FairnessEngine.getCoinflipResult(outcome)
+
+    // Save fairness record
+    await this.prisma.fairnessRecord.create({
+      data: {
+        userId,
+        serverSeed: seedPair.serverSeed,
+        serverSeedHash: seedPair.serverSeedHash,
+        clientSeed: seedPair.clientSeed,
+        nonce: seedPair.nonce,
+        result,
+        outcome,
+        gameType,
+      },
+    })
+
+    // Increment nonce for next round
+    await this.prisma.seedPair.update({
+      where: { id: seedPair.id },
+      data: { nonce: { increment: 1 } },
+    })
+
+    return {
+      result,
+      payout,
+      outcome,
+      serverSeedHash: seedPair.serverSeedHash,
+      clientSeed: seedPair.clientSeed,
+      nonce: seedPair.nonce,
+      message: 'Server seed will be revealed when you rotate seeds.',
+    }
+  }
+
+  // Rotate seeds — reveals old server seed so player can verify
+  async rotateSeed(userId: number, newClientSeed?: string) {
+    const oldSeedPair = await this.prisma.seedPair.findFirst({
+      where: { userId, revealed: false },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    if (!oldSeedPair) {
+      throw new BadRequestException('No active seed pair found')
+    }
+
+    // Mark old seed as revealed
+    await this.prisma.seedPair.update({
+      where: { id: oldSeedPair.id },
+      data: { revealed: true },
+    })
+
+    // Create new seed pair
+    const newServerSeed = FairnessEngine.generateServerSeed()
+    const newServerSeedHash = FairnessEngine.hashServerSeed(newServerSeed)
+    const finalClientSeed = newClientSeed || FairnessEngine.generateServerSeed()
+
+    const newSeedPair = await this.prisma.seedPair.create({
+      data: {
+        userId,
+        serverSeed: newServerSeed,
+        serverSeedHash: newServerSeedHash,
+        clientSeed: finalClientSeed,
+        nonce: 0,
+      },
+    })
+
+    return {
+      previousServerSeed: oldSeedPair.serverSeed,  // now revealed
+      previousServerSeedHash: oldSeedPair.serverSeedHash,
+      previousClientSeed: oldSeedPair.clientSeed,
+      newServerSeedHash: newSeedPair.serverSeedHash,
+      newClientSeed: newSeedPair.clientSeed,
+      message: 'Previous server seed revealed. Use it to verify your past rounds.',
+    }
+  }
+
+  // Verify a past round
+  async verifyRound(
+    serverSeed: string,
+    serverSeedHash: string,
+    clientSeed: string,
+    nonce: number,
+  ) {
+    const verification = FairnessEngine.verifyRound(
+      serverSeed,
+      serverSeedHash,
+      clientSeed,
+      nonce,
+    )
+
+    return {
+      ...verification,
+      message: verification.valid
+        ? 'Round verified — server seed matches hash. Result is provably fair.'
+        : 'Verification failed — server seed does not match hash.',
+    }
+  }
+
+  // Get all fairness records for a user
+  async getUserRecords(userId: number) {
+    return this.prisma.fairnessRecord.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        serverSeedHash: true,
+        clientSeed: true,
+        nonce: true,
+        result: true,
+        outcome: true,
+        gameType: true,
+        createdAt: true,
+        // serverSeed only included after rotation
+      },
+    })
+  }
+
+  // Get current active seed info for user
+  async getCurrentSeed(userId: number) {
+    const seedPair = await this.prisma.seedPair.findFirst({
+      where: { userId, revealed: false },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    if (!seedPair) return null
+
+    return {
+      serverSeedHash: seedPair.serverSeedHash,
+      clientSeed: seedPair.clientSeed,
+      nonce: seedPair.nonce,
+    }
+  }
+}
+==================================================================================
+[src/fairness/fairness.controller.ts]
+
+import {
+  Controller, Post, Get, Body, Headers,
+  UnauthorizedException, BadRequestException
+} from '@nestjs/common'
+import { FairnessService } from './fairness.service'
+
+@Controller('fairness')
+export class FairnessController {
+  constructor(private fairnessService: FairnessService) {}
+
+  private validateInternalKey(key: string) {
+    if (!key || key !== process.env.INTERNAL_API_KEY) {
+      throw new UnauthorizedException('Internal access only')
+    }
+  }
+
+  // Initialize seed pair for a user
+  @Post('init')
+  async init(
+    @Headers('x-internal-key') key: string,
+    @Body() body: { userId: number; clientSeed?: string },
+  ) {
+    this.validateInternalKey(key)
+    if (!body.userId) throw new BadRequestException('userId required')
+    return this.fairnessService.initSeedPair(body.userId, body.clientSeed)
+  }
+
+  // Play a round — returns result + fairness proof
+  @Post('play')
+  async play(
+    @Headers('x-internal-key') key: string,
+    @Body() body: { userId: number; gameType?: string },
+  ) {
+    this.validateInternalKey(key)
+    if (!body.userId) throw new BadRequestException('userId required')
+    return this.fairnessService.playRound(body.userId, body.gameType)
+  }
+
+  // Rotate seeds — reveals old server seed
+  @Post('rotate')
+  async rotate(
+    @Headers('x-internal-key') key: string,
+    @Body() body: { userId: number; newClientSeed?: string },
+  ) {
+    this.validateInternalKey(key)
+    if (!body.userId) throw new BadRequestException('userId required')
+    return this.fairnessService.rotateSeed(body.userId, body.newClientSeed)
+  }
+
+  // Public verify endpoint — anyone can verify a past round
+  @Post('verify')
+  async verify(
+    @Body() body: {
+      serverSeed: string
+      serverSeedHash: string
+      clientSeed: string
+      nonce: number
+    },
+  ) {
+    const { serverSeed, serverSeedHash, clientSeed, nonce } = body
+    if (!serverSeed || !serverSeedHash || !clientSeed || nonce === undefined) {
+      throw new BadRequestException('serverSeed, serverSeedHash, clientSeed and nonce are all required')
+    }
+    return this.fairnessService.verifyRound(serverSeed, serverSeedHash, clientSeed, nonce)
+  }
+
+  // Get current seed info for user
+  @Get('seed')
+  async getSeed(
+    @Headers('x-internal-key') key: string,
+    @Body() body: { userId: number },
+  ) {
+    this.validateInternalKey(key)
+    return this.fairnessService.getCurrentSeed(body.userId)
+  }
+
+  // Get fairness records for user
+  @Get('records')
+  async getRecords(
+    @Headers('x-internal-key') key: string,
+    @Body() body: { userId: number },
+  ) {
+    this.validateInternalKey(key)
+    return this.fairnessService.getUserRecords(body.userId)
+  }
+}
+
+=============================================================================================
+[src/fairness/fairness.module.ts]
+
+import { Module } from '@nestjs/common'
+import { FairnessService } from './fairness.service'
+import { FairnessController } from './fairness.controller'
+import { PrismaService } from '../prisma/prisma.service'
+
+@Module({
+  providers: [FairnessService, PrismaService],
+  controllers: [FairnessController],
+})
+export class FairnessModule {}
+
+=================================================================================
+[provably-fair-service/src/health.controller.ts]
+
+import { Controller, Get } from '@nestjs/common'
+
+@Controller('health')
+export class HealthController {
+  @Get()
+  check() {
+    return {
+      status: 'ok',
+      service: 'provably-fair-service',
+      timestamp: new Date().toISOString(),
+    }
+  }
+}
+
+==================================================================================
+[provably-fair-service/src/app.module.ts]
+
+import { Module } from '@nestjs/common'
+import { FairnessModule } from './fairness/fairness.module'
+import { HealthController } from './health.controller'
+
+@Module({
+  imports: [FairnessModule],
+  controllers: [HealthController],
+})
+export class AppModule {}
+
+========================================================================================
+[provably-fair-service/src/main.ts]
+
+import { NestFactory } from '@nestjs/core'
+import { AppModule } from './app.module'
+import { ValidationPipe } from '@nestjs/common'
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule)
+  app.enableCors()
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+  await app.listen(process.env.PORT || 3005)
+}
+bootstrap()
+
+=====================================================================================
+[provably-fair-service/Dockerfile]
+
+FROM node:22-slim
+
+RUN apt-get update -y && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY prisma ./prisma
+RUN npx prisma generate
+
+COPY . .
+RUN npm run build
+
+EXPOSE 3005
+
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main"]
+
+================================================================================
+[provably-fair-service/.dockerignore]
+
+node_modules
+dist
+.env
+*.log
+
+=========================================================================
+[Build and start]
+
+cd /workspaces/Backend-viral/backend
+
+[Create fairness DB first]
+
+docker exec -it viral_postgres psql -U viral_user -d viral_auth_db -c "CREATE DATABASE viral_fairness_db;"
+docker exec -it viral_postgres psql -U viral_user -d viral_fairness_db -c "GRANT ALL PRIVILEGES ON SCHEMA public TO viral_user;"
+
+docker-compose down
+docker-compose build --no-cache
+docker-compose up -d
+
+docker-compose logs -f fairness
+
+=================================================================================
+[Test the full provably fair flow]
+
+# Login
+TOKEN=$(curl -s -X POST http://localhost/auth/login \
+-H "Content-Type: application/json" \
+-d '{"email":"docker@viral.com","password":"123456"}' | jq -r '.token')
+
+echo "Token: $TOKEN"
+
+# Init seed pair for user 1
+curl -s -X POST http://localhost/fairness/init \
+-H "Content-Type: application/json" \
+-H "x-internal-key: viral_internal_secret_key_2024" \
+-d '{"userId":1}' | jq
+
+# Play a round — notice fairness object in response
+curl -s -X POST http://localhost/game/play \
+-H "Authorization: Bearer $TOKEN" \
+-H "Content-Type: application/json" \
+-d '{"playerId":1,"bet":10}' | jq
+
+# Rotate seeds — reveals old server seed
+curl -s -X POST http://localhost/fairness/rotate \
+-H "Content-Type: application/json" \
+-H "x-internal-key: viral_internal_secret_key_2024" \
+-d '{"userId":1}' | jq
+
+==============================================================================
+[Take the previousServerSeed, previousServerSeedHash, previousClientSeed and nonce from the rotate response and verify]
+
+Verify the round — public endpoint, no key needed
+curl -s -X POST http://localhost/fairness/verify \
+-H "Content-Type: application/json" \
+-d '{
+  "serverSeed": "paste_previous_server_seed",
+  "serverSeedHash": "paste_previous_server_seed_hash",
+  "clientSeed": "paste_client_seed",
+  "nonce": 0
+}' | jq
+
+==========================================================================
+[Expected response]
+
+{
+  "valid": true,
+  "outcome": 0.234567,
+  "result": "win",
+  "computedHash": "abc123...",
+  "message": "Round verified — server seed matches hash. Result is provably fair."
+}
+================================================================================================
+================================================================================================
+
+
+
 
 
 
@@ -2486,6 +3186,7 @@ services:
       DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_game_db
       WALLET_SERVICE_URL: http://wallet:3002
       HISTORY_SERVICE_URL: http://history:3004
+      FAIRNESS_SERVICE_URL: http://fairness:3005
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
       REDIS_URL: redis://redis:6379
       PORT: 3003
@@ -2535,8 +3236,30 @@ services:
     ports:
       - "80:80"
 
+  fairness:
+    build: ./provably-fair-service
+    container_name: viral_fairness
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://viral_user:viral123@postgres:5432/viral_fairness_db
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      PORT: 3005
+    ports:
+      - "3005:3005"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3005/health', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
 volumes:
   postgres_data:
+
   
 ====================================================================================================
 
@@ -2548,11 +3271,13 @@ SELECT 'CREATE DATABASE viral_auth_db' WHERE NOT EXISTS (SELECT FROM pg_database
 SELECT 'CREATE DATABASE viral_wallet_db' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'viral_wallet_db')\gexec
 SELECT 'CREATE DATABASE viral_game_db' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'viral_game_db')\gexec
 SELECT 'CREATE DATABASE viral_history_db' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'viral_history_db')\gexec
+SELECT 'CREATE DATABASE viral_fairness_db' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'viral_fairness_db')\gexec
 
 GRANT ALL PRIVILEGES ON DATABASE viral_auth_db TO viral_user;
 GRANT ALL PRIVILEGES ON DATABASE viral_wallet_db TO viral_user;
 GRANT ALL PRIVILEGES ON DATABASE viral_game_db TO viral_user;
 GRANT ALL PRIVILEGES ON DATABASE viral_history_db TO viral_user;
+GRANT ALL PRIVILEGES ON DATABASE viral_fairness_db TO viral_user;
 
 =====================================================================================
 
